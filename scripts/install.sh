@@ -90,10 +90,18 @@ get_bin_dir() {
 # ── Downloader (curl preferred, wget fallback) ────────────────────────────────
 download() {
     local url="$1" dest="$2"
+    local http_code
     if command -v curl &>/dev/null; then
-        curl -fsSL --retry 3 --retry-delay 2 -o "$dest" "$url"
+        http_code=$(curl -sSL --retry 3 --retry-delay 2 -w "%{http_code}" -o "$dest" "$url")
+        if [ "$http_code" -ge 400 ]; then
+            rm -f "$dest"
+            fail "Download failed (HTTP $http_code).\n  URL: $url\n  Make sure a GitHub Release exists for this version."
+        fi
     elif command -v wget &>/dev/null; then
-        wget -q --tries=3 --waitretry=2 -O "$dest" "$url"
+        if ! wget -q --tries=3 --waitretry=2 -O "$dest" "$url"; then
+            rm -f "$dest"
+            fail "Download failed.\n  URL: $url\n  Make sure a GitHub Release exists for this version."
+        fi
     else
         fail "Neither curl nor wget found. Install one and retry."
     fi
@@ -102,7 +110,9 @@ download() {
 download_stdout() {
     local url="$1"
     if command -v curl &>/dev/null; then
-        curl -fsSL --retry 3 "$url"
+        # -sSL without -f so we get the response body even on 4xx/5xx;
+        # we check the content ourselves for better error messages.
+        curl -sSL --retry 3 --retry-delay 2 "$url"
     else
         wget -q -O- "$url"
     fi
@@ -111,10 +121,33 @@ download_stdout() {
 # ── Latest version from GitHub API ────────────────────────────────────────────
 get_latest_version() {
     if [ -n "$PINNED_VERSION" ]; then echo "$PINNED_VERSION"; return; fi
-    download_stdout "$API_BASE/releases/latest" \
-        | grep '"tag_name"' \
-        | head -1 \
-        | sed 's/.*"tag_name": *"\(.*\)".*/\1/'
+
+    local response
+    response=$(download_stdout "$API_BASE/releases/latest" 2>/dev/null) || true
+
+    # GitHub returns {"message":"Not Found"} when no release exists yet.
+    if echo "$response" | grep -q '"message"'; then
+        local msg
+        msg=$(echo "$response" | grep '"message"' | sed 's/.*"message": *"\(.*\)".*/\1/')
+        echo ""
+        echo -e "  ${RED}No GitHub Release found.${NC}" >&2
+        echo -e "  ${DIM}GitHub says: ${msg}${NC}" >&2
+        echo "" >&2
+        echo -e "  ${YELLOW}To create the first release:${NC}" >&2
+        echo -e "  ${DIM}  git tag v0.1.0 && git push origin v0.1.0${NC}" >&2
+        echo -e "  ${DIM}  GitHub Actions will build and publish it automatically.${NC}" >&2
+        echo "" >&2
+        exit 1
+    fi
+
+    local tag
+    tag=$(echo "$response" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\(.*\)".*/\1/')
+
+    if [ -z "$tag" ]; then
+        fail "Could not parse version from GitHub API response.\n  Try: curl $API_BASE/releases/latest"
+    fi
+
+    echo "$tag"
 }
 
 # ── Resolve artifact filename ──────────────────────────────────────────────────
