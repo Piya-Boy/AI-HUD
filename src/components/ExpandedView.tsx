@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import type { HudState } from "../lib/types";
+import UpdateToast from "./UpdateToast";
 
 // Session: countdown "Resets in X hr Y min"
 function formatSessionReset(epochSec: number | null): string {
@@ -123,6 +124,9 @@ export default function ExpandedView({ state, onMinimize, onRefresh }: Props) {
         </div>
         <div className="chen-reset-text">{weeklyResetLabel}</div>
       </div>
+
+      {/* Update toast — only shown when an update is available */}
+      <UpdateToast />
 
       {/* Footer */}
       <div

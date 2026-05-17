@@ -21,6 +21,7 @@
 use crate::process_watcher::{AiSessionEvent, ProcSnapshotEntry, SharedSnapshot};
 use crate::terminal_resolver;
 use crate::window_tracker::TerminalBounds;
+use crate::wt_tab_detector;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -91,40 +92,56 @@ fn raise_above_owner(overlay_hwnd_value: isize) {
     }
 }
 
-/// Strict foreground validation. Returns true ONLY when the user is
-/// currently interacting with the terminal that owns this overlay.
-///
-/// Test order:
-///   1. Foreground HWND == terminal HWND  → yes (direct match)
-///   2. Foreground HWND's owner chain contains terminal HWND → yes (popup of terminal)
-///   3. Foreground HWND belongs to the SAME PROCESS as terminal HWND → yes
-///      (covers Windows Terminal: different HWND per tab but same wt.exe PID)
-///   4. Otherwise → NO. Overlay must hide.
-///
-/// We deliberately do NOT use ancestor process tree matching — that would
-/// let VSCode show the overlay because VSCode hosts conhost which is in
-/// the same process tree as the AI CLI. Strict PID equality only.
+/// Hard hide via Win32. Tauri's `win.hide()` goes through the webview
+/// abstraction and may be ignored or delayed for owned windows. ShowWindow
+/// + SW_HIDE is synchronous and unconditional.
 #[cfg(target_os = "windows")]
-fn terminal_is_foreground(terminal_hwnd_value: isize) -> bool {
+fn hard_hide(overlay_hwnd_value: isize) {
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindow, GetWindowThreadProcessId, GW_OWNER,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    if overlay_hwnd_value == 0 {
+        return;
+    }
+    let h = HWND(overlay_hwnd_value as *mut _);
+    unsafe {
+        let _ = ShowWindow(h, SW_HIDE);
+    }
+}
+
+/// STRICT foreground validation: returns true ONLY when the foreground
+/// HWND is the exact terminal HWND that owns this overlay (or one of its
+/// owned popups — e.g. a context menu of that specific terminal).
+///
+/// We deliberately do NOT match by:
+///   - same PID (Windows Terminal hosts every tab in one wt.exe process —
+///     matching by PID would show the overlay on a plain-shell tab when
+///     the AI is in a different tab)
+///   - ancestor process tree (would falsely match VSCode/conhost siblings)
+///   - window class or title (unreliable, easily spoofed)
+///
+/// HWND equality is the only safe identity.
+///
+/// Returns (matches, foreground_hwnd_value) — second value is for diagnostic
+/// logging so the caller can emit `[focus]` only on transitions.
+#[cfg(target_os = "windows")]
+fn check_terminal_is_foreground(terminal_hwnd_value: isize) -> (bool, isize) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindow, GW_OWNER};
     if terminal_hwnd_value == 0 {
-        return false;
+        return (false, 0);
     }
     unsafe {
         let fg = GetForegroundWindow();
+        let fg_value = fg.0 as isize;
         if fg.0.is_null() {
-            return false;
+            return (false, 0);
         }
 
-        // 1. Direct HWND match
-        if fg.0 as isize == terminal_hwnd_value {
-            return true;
+        // 1. Direct HWND match.
+        if fg_value == terminal_hwnd_value {
+            return (true, fg_value);
         }
 
-        // 2. Owner-chain match
+        // 2. Foreground HWND is an OWNED popup of the terminal.
         let mut current = fg;
         for _ in 0..8 {
             let owner = match GetWindow(current, GW_OWNER) {
@@ -132,38 +149,32 @@ fn terminal_is_foreground(terminal_hwnd_value: isize) -> bool {
                 _ => break,
             };
             if owner.0 as isize == terminal_hwnd_value {
-                return true;
+                return (true, fg_value);
             }
             current = owner;
         }
 
-        // 3. Same-PID match (Windows Terminal multi-HWND-per-tab case)
-        let terminal_hwnd = HWND(terminal_hwnd_value as *mut _);
-        let mut fg_pid: u32 = 0;
-        let mut term_pid: u32 = 0;
-        GetWindowThreadProcessId(fg, Some(&mut fg_pid));
-        GetWindowThreadProcessId(terminal_hwnd, Some(&mut term_pid));
-        if fg_pid != 0 && term_pid != 0 && fg_pid == term_pid {
-            return true;
-        }
-
-        false
+        (false, fg_value)
     }
 }
 
-/// Check if any portion of the terminal's window rect is actually visible
-/// on screen (not fully occluded by another window). Uses a simple sampling
-/// strategy: pick a few interior points and ask Windows what HWND is there.
-/// If none of them resolve to the terminal HWND or one of its child/owned
-/// windows, treat the terminal as occluded.
+#[cfg(target_os = "windows")]
+fn terminal_is_foreground(terminal_hwnd_value: isize) -> bool {
+    check_terminal_is_foreground(terminal_hwnd_value).0
+}
+
+/// Check if the terminal's window rect is occluded by another window.
+/// Probes interior sample points via WindowFromPoint and checks whether
+/// any of them resolve to THE EXACT terminal HWND. Same-PID matches are
+/// rejected — a different tab in the same wt.exe is, for our purposes,
+/// a different window and counts as occlusion.
 #[cfg(target_os = "windows")]
 fn terminal_is_occluded(terminal_hwnd_value: isize, b: &TerminalBounds) -> bool {
-    use windows::Win32::Foundation::{HWND, POINT};
+    use windows::Win32::Foundation::POINT;
     use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, WindowFromPoint, GA_ROOT};
     if terminal_hwnd_value == 0 || b.width <= 0 || b.height <= 0 {
         return false;
     }
-    // Probe four spread-out interior points (avoid edges due to DWM shadow).
     let inset = 16;
     let pts = [
         (b.x + inset,            b.y + inset),
@@ -178,19 +189,9 @@ fn terminal_is_occluded(terminal_hwnd_value: isize, b: &TerminalBounds) -> bool 
             if hit.0.is_null() {
                 continue;
             }
-            // Walk to top-level so we compare to terminal_hwnd_value (a top-level HWND).
             let top = GetAncestor(hit, GA_ROOT);
             let top_value = if top.0.is_null() { hit.0 as isize } else { top.0 as isize };
             if top_value == terminal_hwnd_value {
-                return false; // at least one sample point is owned by the terminal
-            }
-            // Same-process check (Windows Terminal sub-HWNDs)
-            use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
-            let mut hit_pid: u32 = 0;
-            let mut term_pid: u32 = 0;
-            GetWindowThreadProcessId(HWND(top_value as *mut _), Some(&mut hit_pid));
-            GetWindowThreadProcessId(HWND(terminal_hwnd_value as *mut _), Some(&mut term_pid));
-            if hit_pid != 0 && hit_pid == term_pid {
                 return false;
             }
         }
@@ -218,7 +219,11 @@ fn set_owner(_overlay_hwnd_value: isize, _terminal_hwnd_value: isize) {}
 #[cfg(not(target_os = "windows"))]
 fn raise_above_owner(_overlay_hwnd_value: isize) {}
 #[cfg(not(target_os = "windows"))]
+fn hard_hide(_overlay_hwnd_value: isize) {}
+#[cfg(not(target_os = "windows"))]
 fn terminal_is_foreground(_terminal_hwnd_value: isize) -> bool { true }
+#[cfg(not(target_os = "windows"))]
+fn check_terminal_is_foreground(_terminal_hwnd_value: isize) -> (bool, isize) { (true, 0) }
 #[cfg(not(target_os = "windows"))]
 fn terminal_is_occluded(_terminal_hwnd_value: isize, _b: &TerminalBounds) -> bool { false }
 #[cfg(not(target_os = "windows"))]
@@ -239,9 +244,15 @@ pub struct OverlayInstance {
     pub hwnd_value: isize,
     pub attached_sessions: HashSet<String>,
     pub last_bounds: TerminalBounds,
-    /// Cached: was the terminal the foreground window on the last tick?
-    /// Drives hide/show transitions without spamming visibility changes.
-    pub last_foreground: bool,
+    /// Whether the overlay was visible on the last tick. Used purely for
+    /// transition logging — every tick still re-decides from scratch.
+    pub last_visible: bool,
+    /// The Windows Terminal tab name that was selected when this overlay
+    /// was created. We assume the AI CLI was launched into the currently
+    /// active tab. On every tick we compare against the live selected-tab
+    /// name; mismatch ⇒ user switched tabs ⇒ hide overlay.
+    /// `None` for non-wt terminals (where every window is its own HWND).
+    pub expected_tab_name: Option<String>,
     #[allow(dead_code)]
     pub last_spawn: Instant,
     #[allow(dead_code)]
@@ -404,12 +415,22 @@ pub fn spawn_overlay(
     let mut attached = HashSet::new();
     attached.insert(event.session_id.clone());
 
+    // Capture the active Windows Terminal tab name at spawn time. The AI CLI
+    // was just launched, so the currently-selected tab IS the one running it.
+    // If this terminal isn't Windows Terminal, the call returns None and we
+    // skip tab-aware visibility checks (HWND identity is sufficient).
+    let expected_tab_name = wt_tab_detector::current_selected_tab_name(hwnd_value);
+    if let Some(ref name) = expected_tab_name {
+        println!("[overlay] captured tab name: '{}' for HWND=0x{:x}", name, hwnd_value);
+    }
+
     reg.by_hwnd.insert(hwnd_value, OverlayInstance {
         window_label: label,
         hwnd_value,
         attached_sessions: attached,
         last_bounds: bounds,
-        last_foreground: false,
+        last_visible: false,
+        expected_tab_name,
         last_spawn: Instant::now(),
         provider_id_for_url: event.provider_id.clone(),
     });
@@ -468,84 +489,135 @@ pub fn start_anchor_loop(app: AppHandle, overlays: SharedOverlays, snapshot: Sha
             }
         }
 
-        // Snapshot active overlays (bounds + last foreground state)
-        let live: Vec<(isize, String, TerminalBounds, bool)> = {
+        // Snapshot active overlays (carry expected_tab_name too)
+        let live: Vec<(isize, String, bool, Option<String>)> = {
             let reg = overlays.lock().unwrap();
             reg.by_hwnd
                 .iter()
                 .map(|(h, inst)| (
                     *h,
                     inst.window_label.clone(),
-                    inst.last_bounds.clone(),
-                    inst.last_foreground,
+                    inst.last_visible,
+                    inst.expected_tab_name.clone(),
                 ))
                 .collect()
         };
 
         let mut dead_hwnds: Vec<isize> = Vec::new();
 
-        for (hwnd_value, label, last_bounds, last_fg) in live {
+        for (hwnd_value, label, last_visible, expected_tab) in live {
+            // Step 1: terminal HWND must still be a valid, visible window.
+            if !terminal_is_visible(hwnd_value) {
+                dead_hwnds.push(hwnd_value);
+                continue;
+            }
+
+            // Step 2: gather current state.
             let bounds = terminal_resolver::bounds_for_hwnd(hwnd_value);
             if !bounds.is_found || bounds.width == 0 {
                 dead_hwnds.push(hwnd_value);
                 continue;
             }
 
-            let is_fg = terminal_is_foreground(hwnd_value);
-            let bounds_changed = bounds != last_bounds;
-            let fg_changed = is_fg != last_fg;
+            // Step 3: compute strict visibility — ALL must be true:
+            //   - not minimized
+            //   - terminal IS the foreground window (strict HWND match)
+            //   - not fully occluded
+            //   - if Windows Terminal: currently selected tab name matches
+            //     the tab the AI CLI was launched into
+            let is_minimized = bounds.is_minimized;
+            let (is_fg, fg_hwnd) = if is_minimized {
+                (false, 0)
+            } else {
+                check_terminal_is_foreground(hwnd_value)
+            };
+            let occluded = is_fg && terminal_is_occluded(hwnd_value, &bounds);
 
-            // Log significant transitions
-            if bounds.is_minimized && !last_bounds.is_minimized {
-                println!("[overlay] minimized HWND=0x{:x}", hwnd_value);
-            } else if !bounds.is_minimized && last_bounds.is_minimized {
-                println!("[overlay] restored HWND=0x{:x}", hwnd_value);
-            }
-            if fg_changed {
+            // Tab check (only meaningful when we captured one at spawn).
+            // We only call UIA when terminal is foreground — UIA is heavy,
+            // and tab identity doesn't matter when terminal isn't visible.
+            let tab_ok = match &expected_tab {
+                Some(expected) if is_fg && !occluded => {
+                    match wt_tab_detector::current_selected_tab_name(hwnd_value) {
+                        Some(current) => &current == expected,
+                        // UIA failed — fail SAFE (hide) rather than show on wrong tab.
+                        None => false,
+                    }
+                }
+                // No tab signature captured (non-wt terminal) → trust HWND only.
+                _ => true,
+            };
+
+            let should_show = !is_minimized && is_fg && !occluded && tab_ok;
+
+            // Step 4: log transitions only.
+            if should_show != last_visible {
                 println!(
-                    "[overlay] terminal HWND=0x{:x} foreground={}",
-                    hwnd_value, is_fg
+                    "[focus] foreground=0x{:x} terminal=0x{:x} match={}",
+                    fg_hwnd as usize,
+                    hwnd_value as usize,
+                    is_fg
                 );
+                if should_show {
+                    println!("[overlay] visible=true hwnd=0x{:x}", hwnd_value);
+                } else {
+                    let reason = if is_minimized {
+                        "minimized"
+                    } else if !is_fg {
+                        "foreground_changed"
+                    } else if occluded {
+                        "occluded"
+                    } else if !tab_ok {
+                        "tab_changed"
+                    } else {
+                        "unknown"
+                    };
+                    println!(
+                        "[overlay] visible=false hwnd=0x{:x} reason={}",
+                        hwnd_value, reason
+                    );
+                }
             }
 
-            // Always re-evaluate visibility every tick when foreground.
-            // Skip only when fully stable AND backgrounded (already hidden).
-            if !bounds_changed && !fg_changed && !is_fg {
-                continue;
-            }
-
+            // Step 5: dispatch to main thread. RE-CHECK every condition there
+            // — there's a race window where foreground/tab could change.
             let app_clone = app.clone();
             let label_clone = label.clone();
             let bounds_clone = bounds.clone();
+            let hwnd_for_closure = hwnd_value;
+            let expected_tab_clone = expected_tab.clone();
+            // Decision computed on watcher thread (already includes UIA result).
+            // Main thread only needs to act — no further heavy checks there.
+            let decided_show = should_show;
             let _ = app.run_on_main_thread(move || {
                 let Some(win) = app_clone.get_webview_window(&label_clone) else { return };
+                let overlay_hwnd_value: isize = match win.hwnd() {
+                    Ok(h) => h.0 as isize,
+                    Err(_) => return,
+                };
+                // Tiny re-check on main thread: only cheap Win32 calls
+                // (no UIA — UIA on UI thread can deadlock the webview).
+                let still_fg = terminal_is_foreground(hwnd_for_closure)
+                    && terminal_is_visible(hwnd_for_closure);
+                let act_show = decided_show && still_fg;
 
-                // HIDE when terminal is minimized OR not the foreground window.
-                // The foreground gate prevents the overlay from floating above
-                // unrelated apps (VSCode, browsers, fullscreen apps).
-                if bounds_clone.is_minimized || !is_fg {
-                    let _ = win.hide();
+                let _ = (bounds_clone.clone(), expected_tab_clone.clone(), hwnd_for_closure);
+
+                if !act_show {
+                    hard_hide(overlay_hwnd_value);
                     return;
                 }
 
-                // Reposition into top-right of terminal visible area.
                 let scale = bounds_clone.scale_factor.max(0.1);
                 let overlay_physical_w = (OVERLAY_LOGICAL_W * scale).round() as i32;
                 let (px, py) = compute_topright(&bounds_clone, overlay_physical_w);
                 let _ = win.set_position(tauri::PhysicalPosition::new(px, py));
-
-                // Raise above owner (NON-topmost) — anchors overlay into
-                // the terminal's z-order layer, not the global topmost layer.
-                if let Ok(overlay_hwnd_raw) = win.hwnd() {
-                    raise_above_owner(overlay_hwnd_raw.0 as isize);
-                } else {
-                    let _ = win.show();
-                }
+                raise_above_owner(overlay_hwnd_value);
             });
 
             if let Some(inst) = overlays.lock().unwrap().by_hwnd.get_mut(&hwnd_value) {
                 inst.last_bounds = bounds;
-                inst.last_foreground = is_fg;
+                inst.last_visible = should_show;
             }
         }
 

@@ -4,10 +4,13 @@ mod window_tracker;
 mod process_watcher;
 mod terminal_resolver;
 mod overlay_manager;
+mod wt_tab_detector;
+mod updater;
 
 use models::{HudSettings, HudState};
 use process_watcher::{ActiveSessions, AiSessionEvent, SharedSessions, SharedSnapshot};
 use providers::ProviderManager;
+use updater::UpdateStatus;
 use window_tracker::TerminalBounds;
 use overlay_manager::SharedOverlays;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,14 +67,7 @@ async fn update_settings(
 ) -> Result<(), String> {
     let mut s = settings.lock().map_err(|e| e.to_string())?;
     *s = new_settings;
-    if let Some(config_dir) = dirs_next::config_dir() {
-        let dir = config_dir.join("ai-hud");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("settings.json");
-        if let Ok(json) = serde_json::to_string_pretty(&*s) {
-            let _ = std::fs::write(path, json);
-        }
-    }
+    save_settings_to_disk(&s);
     Ok(())
 }
 
@@ -97,6 +93,45 @@ async fn set_click_through(window: tauri::Window, enabled: bool) -> Result<(), S
     window
         .set_ignore_cursor_events(enabled)
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn check_for_update(
+    settings: tauri::State<'_, Arc<Mutex<HudSettings>>>,
+) -> Result<UpdateStatus, String> {
+    let (channel, skipped) = {
+        let s = settings.lock().map_err(|e| e.to_string())?;
+        (s.update_channel.clone(), s.skipped_version.clone())
+    };
+    let current = tauri::VERSION.to_string();
+    Ok(updater::force_check(&current, &channel, skipped.as_deref()))
+}
+
+#[tauri::command]
+async fn skip_version(
+    version: String,
+    settings: tauri::State<'_, Arc<Mutex<HudSettings>>>,
+) -> Result<(), String> {
+    let mut s = settings.lock().map_err(|e| e.to_string())?;
+    s.skipped_version = Some(version);
+    save_settings_to_disk(&s);
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_app_version() -> Result<String, String> {
+    Ok(tauri::VERSION.to_string())
+}
+
+fn save_settings_to_disk(s: &HudSettings) {
+    if let Some(config_dir) = dirs_next::config_dir() {
+        let dir = config_dir.join("ai-hud");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.json");
+        if let Ok(json) = serde_json::to_string_pretty(s) {
+            let _ = std::fs::write(path, json);
+        }
+    }
 }
 
 fn load_settings() -> HudSettings {
@@ -172,6 +207,7 @@ pub fn run() {
 
     let settings = Arc::new(Mutex::new(load_settings()));
     let settings_clone = settings.clone();
+    let settings_updater_clone = settings.clone();
 
     let mut mgr = ProviderManager::new();
     mgr.register_defaults();
@@ -190,6 +226,8 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(manager.clone())
         .manage(settings.clone())
         .manage(shared_sessions.clone())
@@ -202,14 +240,19 @@ pub fn run() {
             get_active_sessions,
             start_drag,
             set_click_through,
+            check_for_update,
+            skip_version,
+            get_app_version,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
             let handle2 = handle.clone();
             let handle3 = handle.clone();
+            let handle4 = handle.clone();
             start_polling(handle, manager_clone, settings_clone, running_clone);
             start_process_watcher(handle2, sessions_clone, snapshot_clone, overlays_clone);
             overlay_manager::start_anchor_loop(handle3, overlays_anchor_clone, snapshot_anchor_clone);
+            updater::start_update_checker(handle4, settings_updater_clone);
             Ok(())
         })
         .run(tauri::generate_context!())

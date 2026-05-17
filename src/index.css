@@ -923,3 +923,60 @@ html, body, #root {
 ::-webkit-scrollbar-thumb:hover {
   background: rgba(192, 132, 252, 0.3);
 }
+
+/* ── Update toast ── */
+.update-toast {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  background: rgba(8, 8, 16, 0.88);
+  border: 1px solid rgba(192, 132, 252, 0.35);
+  backdrop-filter: blur(16px);
+  box-shadow: 0 0 12px rgba(192, 132, 252, 0.15), 0 4px 16px rgba(0, 0, 0, 0.5);
+  animation: fade-in 0.2s ease-out;
+}
+
+.update-toast-text {
+  font-size: 10px;
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  color: rgba(192, 132, 252, 0.9);
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.update-toast-actions {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.update-toast-btn {
+  font-size: 9px;
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.55);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.update-toast-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.update-toast-btn--primary {
+  border-color: rgba(192, 132, 252, 0.45);
+  background: rgba(192, 132, 252, 0.12);
+  color: rgba(192, 132, 252, 0.9);
+}
+
+.update-toast-btn--primary:hover {
+  background: rgba(192, 132, 252, 0.22);
+  color: rgba(192, 132, 252, 1);
+}

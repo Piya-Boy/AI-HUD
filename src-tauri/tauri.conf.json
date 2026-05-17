@@ -40,6 +40,20 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "PLACEHOLDER_PUBKEY",
+      "endpoints": [
+        "https://github.com/Piya-Boy/AI-HUD/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

@@ -119,6 +119,20 @@ pub struct HudSettings {
     pub enabled_providers: Vec<String>,
     pub show_notifications: bool,
     pub quota_warning_pct: f64,
+    #[serde(default = "default_update_channel")]
+    pub update_channel: String,
+    #[serde(default)]
+    pub skipped_version: Option<String>,
+    #[serde(default = "default_true")]
+    pub auto_update_check: bool,
+}
+
+fn default_update_channel() -> String {
+    "stable".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for HudSettings {
@@ -141,6 +155,9 @@ impl Default for HudSettings {
             ],
             show_notifications: true,
             quota_warning_pct: 85.0,
+            update_channel: "stable".into(),
+            skipped_version: None,
+            auto_update_check: true,
         }
     }
 }
