@@ -4,156 +4,81 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Version tag (e.g. v0.2.0)"
-        required: true
 
 permissions:
   contents: write
 
 jobs:
-  # ── Build matrix ─────────────────────────────────────────────────────────────
-  build:
+  release:
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Windows x64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            platform: windows
-            artifact_suffix: x64-setup.exe
 
-          # macOS Intel
           - os: macos-latest
             target: x86_64-apple-darwin
-            platform: macos-x86
-            artifact_suffix: x64.dmg
 
-          # macOS Apple Silicon
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            platform: macos-arm
-            artifact_suffix: aarch64.dmg
-
-          # Linux x64 (AppImage + deb)
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            platform: linux
-            artifact_suffix: amd64.AppImage
 
     runs-on: ${{ matrix.os }}
-    name: Build · ${{ matrix.platform }}
 
     steps:
-      # ── Source ──────────────────────────────────────────────────────────────
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # ── Node ────────────────────────────────────────────────────────────────
-      - uses: actions/setup-node@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 20
           cache: npm
 
-      # ── Rust ────────────────────────────────────────────────────────────────
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: swatinem/rust-cache@v2
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
-          key: ${{ matrix.target }}
+          workspaces: "./src-tauri -> target"
 
-      # ── Linux system dependencies ────────────────────────────────────────────
-      - name: Install Linux deps
+      - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
-            libgtk-3-dev libglib2.0-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev
+          sudo apt-get update
 
-      # ── Frontend ────────────────────────────────────────────────────────────
-      - run: npm ci
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev \
+            libglib2.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev
 
-      # ── Build & publish ─────────────────────────────────────────────────────
-      - name: Build Tauri app
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Tauri App
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # macOS code-signing (optional — set secrets when you have an Apple cert)
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: "AI-HUD ${{ github.ref_name }}"
+          releaseName: AI-HUD ${{ github.ref_name }}
           releaseBody: |
-            ## What's new
-            See [CHANGELOG](https://github.com/Piya-Boy/AI-HUD/blob/main/CHANGELOG.md) for full details.
+            Automated release for AI-HUD
 
-            ## Install
+            Changes:
+            - Auto updater
+            - Terminal attached overlay
+            - Universal installer
+            - Multi-provider AI CLI support
 
-            **Windows**
-            ```powershell
-            powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/Piya-Boy/AI-HUD/main/scripts/install.ps1 | iex"
-            ```
-
-            **macOS / Linux**
-            ```bash
-            curl -fsSL https://raw.githubusercontent.com/Piya-Boy/AI-HUD/main/scripts/install.sh | bash
-            ```
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
-          args: --target ${{ matrix.target }}
-
-  # ── Checksum + manifest ──────────────────────────────────────────────────────
-  publish:
-    name: Publish checksums & manifest
-    needs: build
-    runs-on: ubuntu-22.04
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download release assets
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ github.ref_name }}"
-          gh release download "$TAG" \
-            --repo "${{ github.repository }}" \
-            --dir ./dist \
-            --pattern "AI-HUD_*" || true
-
-      - name: Generate SHA-256 checksums
-        run: |
-          cd dist
-          for f in *; do
-            [ -f "$f" ] && sha256sum "$f" > "${f}.sha256" && echo "  $f"
-          done
-
-      - name: Upload checksums to release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ github.ref_name }}"
-          gh release upload "$TAG" dist/*.sha256 \
-            --repo "${{ github.repository }}" \
-            --clobber
-
-      - name: Publish release (draft → published)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release edit "${{ github.ref_name }}" \
-            --repo "${{ github.repository }}" \
-            --draft=false
